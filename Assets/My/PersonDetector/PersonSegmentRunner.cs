@@ -30,6 +30,8 @@ namespace PixelMan
     // normBounds: 마스크에서 계산한 사람 bounding box (0~1)
     public event Action<float[], int, int, float, float, float, float> OnMaskReady;
 
+    public bool FlipMaskX { get; private set; }
+
     private float[] _maskArray;
     private int _maskW, _maskH;
 
@@ -76,6 +78,12 @@ namespace PixelMan
       // SelfieSegmenter는 rotation 0 고정
       var imageProcessingOptions = new Mediapipe.Tasks.Vision.Core.ImageProcessingOptions(rotationDegrees: 0);
 
+      var transformationOptions = imageSource.GetTransformationOptions();
+      var flipHorizontally = transformationOptions.flipHorizontally;
+      // flipVertically는 셰이더의 Y-플립(1.0 - uv.y)이 담당하므로 항상 false
+      var flipVertically = false;
+      FlipMaskX = flipHorizontally;
+
       AsyncGPUReadbackRequest req = default;
       var waitUntilReqDone = new WaitUntil(() => req.done);
       var waitForEndOfFrame = new WaitForEndOfFrame();
@@ -101,13 +109,13 @@ namespace PixelMan
         {
           case ImageReadMode.CPU:
             yield return waitForEndOfFrame;
-            textureFrame.ReadTextureOnCPU(imageSource.GetCurrentTexture(), false, false);
+            textureFrame.ReadTextureOnCPU(imageSource.GetCurrentTexture(), flipHorizontally, flipVertically);
             image = textureFrame.BuildCPUImage();
             textureFrame.Release();
             break;
           case ImageReadMode.CPUAsync:
           default:
-            req = textureFrame.ReadTextureAsync(imageSource.GetCurrentTexture(), false, false);
+            req = textureFrame.ReadTextureAsync(imageSource.GetCurrentTexture(), flipHorizontally, flipVertically);
             yield return waitUntilReqDone;
             if (req.hasError) continue;
             image = textureFrame.BuildCPUImage();

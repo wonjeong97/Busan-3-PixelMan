@@ -33,14 +33,15 @@ namespace PixelMan
 
     [Header("Object Detection 모드 참조")]
     [SerializeField] private PersonDetectorRunner _detectorRunner;
+    [SerializeField] private bool _useMaskInODMode = false;   // OD 픽셀 크기 + 세그먼트 마스크 병용
 
     [Header("Segmentation 모드 참조")]
     [SerializeField] private PersonSegmentRunner _segmentRunner;
     [SerializeField] private Shader _pixelateShader;
 
     [Header("픽셀화 설정")]
-    [SerializeField] private float _pixelSizeAtFar = 32f;
-    [SerializeField] private float _pixelSizeAtNear = 4f;
+    [SerializeField] private float _pixelSizeAtFar = 4f;
+    [SerializeField] private float _pixelSizeAtNear = 32f;
     [SerializeField, Range(0.1f, 1f)] private float _nearThreshold = 0.6f;
 
     [Header("수동 픽셀 크기 (테스트용)")]
@@ -96,7 +97,7 @@ namespace PixelMan
 
     private void OnDisable()
     {
-      Unsubscribe(_mode);
+      Unsubscribe(_mode, _useMaskInODMode);
       if (_pixelOverlay != null) _pixelOverlay.gameObject.SetActive(false);
       _smoothingInitialized = false;
       _hasPending = false;
@@ -111,19 +112,23 @@ namespace PixelMan
 
     // 런타임 중 모드 변경 시 재구독
     private PixelMode _prevMode;
+    private bool _prevUseMaskInODMode;
 
     private void Update()
     {
-      if (_mode != _prevMode)
+      bool maskToggleChanged = _mode == PixelMode.ObjectDetection
+                               && _useMaskInODMode != _prevUseMaskInODMode;
+
+      if (_mode != _prevMode || maskToggleChanged)
       {
-        Unsubscribe(_prevMode);
+        Unsubscribe(_prevMode, _prevUseMaskInODMode);
         ApplyRunnerActive(_mode);
         Subscribe(_mode);
         SetupOverlayAnchors(_mode);
-        ResetSmoothing();
+        if (_mode != _prevMode) ResetSmoothing();
         _prevMode = _mode;
+        _prevUseMaskInODMode = _useMaskInODMode;
 
-        // 이전 모드 오버레이 초기화
         if (_pixelOverlay != null)
         {
           _pixelOverlay.material = null;
@@ -133,8 +138,13 @@ namespace PixelMan
 
       switch (_mode)
       {
-        case PixelMode.ObjectDetection: UpdateObjectDetection(); break;
-        case PixelMode.Segmentation:    UpdateSegmentation();    break;
+        case PixelMode.ObjectDetection:
+          if (_useMaskInODMode) UpdateObjectDetectionWithMask();
+          else                  UpdateObjectDetection();
+          break;
+        case PixelMode.Segmentation:
+          UpdateSegmentation();
+          break;
       }
     }
 
@@ -144,18 +154,26 @@ namespace PixelMan
 
     private void Subscribe(PixelMode mode)
     {
-      if (mode == PixelMode.ObjectDetection && _detectorRunner != null)
-        _detectorRunner.OnPersonDetected += HandleDetection;
+      if (mode == PixelMode.ObjectDetection)
+      {
+        if (_detectorRunner != null)
+          _detectorRunner.OnPersonDetected += HandleDetection;
+        if (_useMaskInODMode && _segmentRunner != null)
+          _segmentRunner.OnMaskReady += HandleMaskReadyOD;
+      }
       if (mode == PixelMode.Segmentation && _segmentRunner != null)
         _segmentRunner.OnMaskReady += HandleMaskReady;
     }
 
-    private void Unsubscribe(PixelMode mode)
+    private void Unsubscribe(PixelMode mode, bool useMaskInOD)
     {
       if (_detectorRunner != null)
         _detectorRunner.OnPersonDetected -= HandleDetection;
       if (_segmentRunner != null)
+      {
         _segmentRunner.OnMaskReady -= HandleMaskReady;
+        _segmentRunner.OnMaskReady -= HandleMaskReadyOD;
+      }
     }
 
     private void SetupOverlayAnchors(PixelMode mode)
@@ -163,15 +181,16 @@ namespace PixelMan
       if (_pixelOverlay == null) return;
       var rt = _pixelOverlay.rectTransform;
 
-      if (mode == PixelMode.Segmentation)
+      bool fullScreen = mode == PixelMode.Segmentation
+                        || (mode == PixelMode.ObjectDetection && _useMaskInODMode);
+      if (fullScreen)
       {
-        // 세그멘테이션: 화면 전체 덮음
         rt.anchorMin = Vector2.zero;
         rt.anchorMax = Vector2.one;
         rt.offsetMin = Vector2.zero;
         rt.offsetMax = Vector2.zero;
       }
-      // ObjectDetection: 앵커는 Update에서 박스에 맞게 설정
+      // OD 단독: 앵커는 Update에서 박스에 맞게 설정
     }
 
     private void ApplyRunnerActive(PixelMode mode)
@@ -179,7 +198,8 @@ namespace PixelMan
       if (_detectorRunner != null)
         _detectorRunner.enabled = (mode == PixelMode.ObjectDetection);
       if (_segmentRunner != null)
-        _segmentRunner.enabled = (mode == PixelMode.Segmentation);
+        _segmentRunner.enabled = (mode == PixelMode.Segmentation)
+                                 || (mode == PixelMode.ObjectDetection && _useMaskInODMode);
     }
 
     private void ResetSmoothing()
@@ -246,6 +266,45 @@ namespace PixelMan
       _pixelOverlay.gameObject.SetActive(true);
     }
 
+    // OD 픽셀 크기 + 세그먼트 마스크 병용 렌더링
+    private void UpdateObjectDetectionWithMask()
+    {
+      if (_pixelOverlay == null || _material == null) return;
+
+      if (_currentDetections == null || _currentDetections.Length == 0 || !_smoothingInitialized)
+      {
+        _pixelOverlay.gameObject.SetActive(false);
+        return;
+      }
+
+      var srcImage = _cameraDisplay.GetComponent<RawImage>();
+      if (srcImage == null || srcImage.texture == null)
+      {
+        _pixelOverlay.gameObject.SetActive(false);
+        return;
+      }
+
+      if (_hasPending)
+      {
+        EnsureMaskTexture(_pendingW, _pendingH);
+        _maskTexture.SetPixelData(_pendingMask, 0);
+        _maskTexture.Apply(false);
+        _hasPending = false;
+
+        _material.SetTexture("_MaskTex", _maskTexture);
+        _pixelOverlay.texture  = srcImage.texture;
+        _pixelOverlay.uvRect   = srcImage.uvRect;
+        _pixelOverlay.material = _material;
+      }
+
+      // 픽셀 크기는 OD 바운딩 박스 기준
+      _material.SetFloat("_PixelSize", CalcPixelSize(_sBottom - _sTop));
+      _material.SetFloat("_Threshold", _maskThreshold);
+      _material.SetFloat("_FlipMaskX", (_segmentRunner != null && _segmentRunner.FlipMaskX) ? 1f : 0f);
+
+      _pixelOverlay.gameObject.SetActive(true);
+    }
+
     // ═════════════════════════════════════════════════════════════════════
     //  Segmentation 모드
     // ═════════════════════════════════════════════════════════════════════
@@ -258,6 +317,16 @@ namespace PixelMan
       _pendingH    = h;
       _hasPending  = true;
       UpdateSmoothing(normL, normT, normR, normB);
+    }
+
+    // OD+마스크 병용: 마스크 데이터만 저장, 스무딩은 OD 러너가 담당
+    private void HandleMaskReadyOD(float[] data, int w, int h,
+                                    float normL, float normT, float normR, float normB)
+    {
+      _pendingMask = data;
+      _pendingW    = w;
+      _pendingH    = h;
+      _hasPending  = true;
     }
 
     private void UpdateSegmentation()
@@ -292,9 +361,10 @@ namespace PixelMan
         _pixelOverlay.material = _material;
       }
 
-      // 픽셀 크기·임계값은 매 프레임 갱신 (스무딩 반영)
+      // 픽셀 크기·임계값·X플립은 매 프레임 갱신
       _material.SetFloat("_PixelSize", CalcPixelSize(_sBottom - _sTop));
       _material.SetFloat("_Threshold", _maskThreshold);
+      _material.SetFloat("_FlipMaskX", (_segmentRunner != null && _segmentRunner.FlipMaskX) ? 1f : 0f);
 
       _pixelOverlay.gameObject.SetActive(true);
     }
