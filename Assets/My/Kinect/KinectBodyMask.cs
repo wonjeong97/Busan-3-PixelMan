@@ -185,16 +185,42 @@ namespace PixelMan
         _maskTask = Task.Run(BuildMaskBackground);
     }
 
+    /// <summary>
+    /// 컴포넌트 파괴 시 할당된 메모리와 하드웨어 자원을 해제합니다.
+    /// 하드웨어 센서를 명시적으로 닫지 않으면 다음 실행 시 기기 인식 오류나 멈춤 현상이 발생할 수 있습니다.
+    /// </summary>
     private void OnDestroy()
     {
+      // 백그라운드 스레드 강제 종료 방지 및 안전한 대기
       _maskTask?.Wait();
-      if (_reader       != null) { _reader.Dispose(); _reader = null; }
-      if (_material     != null) Destroy(_material);
-      if (_colorTexture != null) Destroy(_colorTexture);
-      if (_maskTexture  != null) Destroy(_maskTexture);
 
+      // 네이티브 리더 자원 반환
+      if (_reader != null)
+      {
+        _reader.Dispose();
+        _reader = null;
+      }
+
+      // 하드웨어 센서 연결 해제. 기기 오작동 방지.
+      if (_sensor != null)
+      {
+        if (_sensor.IsOpen)
+        {
+          _sensor.Close();
+        }
+        _sensor = null;
+      }
+
+      // 유니티 오브젝트 메모리 누수 방지
+      if (_material) Destroy(_material);
+      if (_colorTexture) Destroy(_colorTexture);
+      if (_maskTexture) Destroy(_maskTexture);
+
+      // 동적 생성된 UI 요소 파괴
       for (int b = 0; b < 6; b++)
-        if (_labelTexts[b] != null) Destroy(_labelTexts[b].gameObject);
+      {
+        if (_labelTexts[b]) Destroy(_labelTexts[b].gameObject);
+      }
     }
 
     // ═══════════════════════════════════════════════════════════════════════
