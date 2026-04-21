@@ -1,17 +1,15 @@
-// PersonPixelate.shader
-// 마스크와 컬러 모두 Point 필터(nearest-neighbor)로 강제 샘플링.
-// 마스크 경계가 픽셀 블록에 정확히 정렬되어 각진 실루엣을 만듭니다.
-
 Shader "PixelMan/PersonPixelate"
 {
     Properties
     {
         _MainTex             ("Camera Texture",          2D)          = "white" {}
         _MaskTex             ("Segmentation Mask",       2D)          = "black" {}
+
         _PixelSize           ("Pixel Size (texels)",     Float)       = 8.0
         _Threshold           ("Mask Threshold",          Range(0, 1)) = 0.5
         _FlipMaskX           ("Flip Mask X",             Float)       = 0.0
         _UsePerBodyPixelSize ("Use Per-Body Pixel Size", Float)       = 0.0
+        _ErosionSize         ("Erosion Size",            Float)       = 5.0 
     }
 
     SubShader
@@ -26,20 +24,24 @@ Shader "PixelMan/PersonPixelate"
             CGPROGRAM
             #pragma vertex   vert
             #pragma fragment frag
-            #pragma target   4.0
             #include "UnityCG.cginc"
 
-            // Texture2D + SamplerState 분리 선언:
-            // sampler_point_clamp 은 Unity 빌트인 nearest-neighbor+clamp 샘플러
             Texture2D    _MainTex;
             Texture2D    _MaskTex;
             SamplerState sampler_point_clamp;
-            float4       _MainTex_TexelSize;   // (1/w, 1/h, w, h)
+
             float        _PixelSize;
             float        _Threshold;
             float        _FlipMaskX;
             float        _UsePerBodyPixelSize;
-            float        _PixelSizes[6];       // 바디 0-5 별 픽셀 크기
+            float        _ErosionSize;
+
+            float        _PixelSize0;
+            float        _PixelSize1;
+            float        _PixelSize2;
+            float        _PixelSize3;
+            float        _PixelSize4;
+            float        _PixelSize5;
 
             struct appdata { float4 vertex : POSITION; float2 uv : TEXCOORD0; };
             struct v2f     { float4 pos    : SV_POSITION; float2 uv : TEXCOORD0; };
@@ -54,40 +56,59 @@ Shader "PixelMan/PersonPixelate"
 
             fixed4 frag(v2f i) : SV_Target
             {
-                float texW = _MainTex_TexelSize.z;  // 1920
-                float texH = _MainTex_TexelSize.w;  // 1080
+                float texW = 1920.0;
+                float texH = 1080.0;
 
+                // 1. 원본 UV에서 마스크를 읽어 현재 픽셀이 어떤 사람인지 식별
                 float  maskX_orig  = _FlipMaskX > 0.5 ? 1.0 - i.uv.x : i.uv.x;
                 float2 origMaskUV  = float2(maskX_orig, 1.0 - i.uv.y);
+                float  origBaseMask = _MaskTex.Sample(sampler_point_clamp, origMaskUV).r;
 
-                // ── 1. 원본 UV 마스크로 바디 인덱스 → 픽셀 크기 ──────────────
-                float ps;
-                if (_UsePerBodyPixelSize > 0.5)
+                // 2. 식별된 사람의 픽셀 크기(ps) 결정. 사람이 아니면 전역 기본값 사용.
+                float ps = _PixelSize;
+                if (_UsePerBodyPixelSize > 0.5 && origBaseMask >= _Threshold)
                 {
-                    float mv0 = _MaskTex.Sample(sampler_point_clamp, origMaskUV).r;
-                    int   bi  = clamp((int)round(mv0 * 6.0) - 1, 0, 5);
-                    ps = max(_PixelSizes[bi], 1.0);
+                    int bi = clamp((int)round(origBaseMask * 6.0) - 1, 0, 5);
+                    if (bi == 0) ps = _PixelSize0;
+                    else if (bi == 1) ps = _PixelSize1;
+                    else if (bi == 2) ps = _PixelSize2;
+                    else if (bi == 3) ps = _PixelSize3;
+                    else if (bi == 4) ps = _PixelSize4;
+                    else if (bi == 5) ps = _PixelSize5;
                 }
-                else
-                {
-                    ps = max(_PixelSize, 1.0);
-                }
+                ps = max(ps, 1.0);
 
-                // ── 2. 정수 텍셀 공간에서 블록 중심 계산 (정확한 픽셀 정렬) ──
-                // i.uv 를 texW/texH 배수 단위로 스냅하면 블록 경계가 텍셀에 정확히 맞음
+                // 3. 현재 픽셀이 속한 "큰 픽셀 블록의 정중앙 UV"를 계산
                 float2 texCoord   = i.uv * float2(texW, texH);
                 float2 blockTexel = floor(texCoord / ps) * ps + ps * 0.5;
                 float2 blockUV    = clamp(blockTexel / float2(texW, texH), 0.0, 1.0);
 
-                // ── 3. 마스크를 블록 중심 UV 로 Point 샘플 → 각진 경계 ────────
-                float  maskX_blk  = _FlipMaskX > 0.5 ? 1.0 - blockUV.x : blockUV.x;
-                float  maskVal    = _MaskTex.Sample(sampler_point_clamp,
-                                        float2(maskX_blk, 1.0 - blockUV.y)).r;
+                // 4. [핵심] 마스크 자르기 판정을 1픽셀 단위가 아닌 "블록의 정중앙"에서 수행
+                // 블록 중심이 마스크 안에 있으면 블록 전체를 그리고, 밖이면 전체를 날려버림 (각진 실루엣 형성)
+                float  maskX_block = _FlipMaskX > 0.5 ? 1.0 - blockUV.x : blockUV.x;
+                float2 blockMaskUV = float2(maskX_block, 1.0 - blockUV.y);
+                float  blockMask = _MaskTex.Sample(sampler_point_clamp, blockMaskUV).r;
 
-                if (maskVal < _Threshold)
-                    return fixed4(0, 0, 0, 1);
+                // 5. 블록 중심 기준 침식(Erosion) 연산
+                if (_ErosionSize > 0.0)
+                {
+                    float offsetX = _ErosionSize / texW;
+                    float offsetY = _ErosionSize / texH;
 
-                // ── 4. 픽셀화된 색상 (Point 샘플 = 선명한 블록 픽셀) ──────────
+                    float maskUp = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(0, offsetY)).r;
+                    float maskDown = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(0, -offsetY)).r;
+                    float maskLeft = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(-offsetX, 0)).r;
+                    float maskRight = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(offsetX, 0)).r;
+
+                    if (maskUp < _Threshold || maskDown < _Threshold || maskLeft < _Threshold || maskRight < _Threshold)
+                    {
+                        return fixed4(0, 0, 0, 1);
+                    }
+                }
+
+                if (blockMask < _Threshold) return fixed4(0, 0, 0, 1);
+
+                // 6. 색상 출력
                 return fixed4(_MainTex.Sample(sampler_point_clamp, blockUV).rgb, 1.0);
             }
             ENDCG
