@@ -14,7 +14,7 @@ namespace PixelMan
         [SerializeField] private Shader _pixelateShader;
 
         [Header("Detection")]
-        [SerializeField, Range(1, 6)] private int _maxUsers;
+        [SerializeField, Range(1, 3)] private int _maxUsers = 3;
 
         [Header("Distance Pixel Settings")]
         [SerializeField] private float _pixelSizeNear;
@@ -30,9 +30,11 @@ namespace PixelMan
         [SerializeField, Range(1f, 128f)] private float _manualPixelSize;
 
         [Header("Label Styling")]
-        [SerializeField] private bool _showLabels;
-        [SerializeField] private int _labelFontSize;
+        [SerializeField] private bool  _showLabels;
+        [SerializeField] private int   _labelFontSize;
         [SerializeField] private Color _labelColor;
+        [Tooltip("라벨 위치/숫자 스무딩 (0=고정, 1=즉시반응)")]
+        [SerializeField, Range(0.01f, 1f)] private float _labelSmoothing = 0.12f;
 
         private KinectSensor _sensor;
         private MultiSourceFrameReader _reader;
@@ -57,7 +59,8 @@ namespace PixelMan
         private readonly int[] _perBodyHeadCy = new int[6];
         private readonly bool[] _perBodyActive = new bool[6];
 
-        private readonly float[] _pixelSizesBuffer = new float[6];
+        private readonly float[] _pixelSizesBuffer  = new float[6];
+        private readonly int[]   _perBodyBlockCount = new int[6];
 
         private Texture2D _colorTexture;
         private Texture2D _maskTexture;
@@ -66,8 +69,13 @@ namespace PixelMan
         private bool _initialized;
         private bool _shaderApplied;
 
-        private readonly Text[] _labelTexts = new Text[6];
-        private readonly RectTransform[] _labelRts = new RectTransform[6];
+        private readonly Text[]          _labelTexts   = new Text[6];
+        private readonly RectTransform[] _labelRts     = new RectTransform[6];
+
+        // 라벨 EMA 스무딩
+        private readonly float[] _smoothHeadCx    = new float[6];
+        private readonly float[] _smoothBlockCount = new float[6];
+        private readonly bool[]  _smoothInit       = new bool[6];
 
         /// <summary>
         /// 바디 인덱스를 쉐이더 마스크용 바이트 값으로 인코딩합니다.
@@ -342,9 +350,26 @@ namespace PixelMan
             for (int b = 0; b < 6; b++)
             {
                 _perBodyDepthMm[b] = depthCount[b] > 0 ? (float)depthSum[b] / depthCount[b] : -1f;
-                _perBodyHeadCx[b] = headCx[b];
-                _perBodyHeadCy[b] = headCy[b] != int.MaxValue ? headCy[b] : 0;
-                _perBodyActive[b] = active[b];
+                _perBodyHeadCx[b]  = headCx[b];
+                _perBodyHeadCy[b]  = headCy[b] != int.MaxValue ? headCy[b] : 0;
+                _perBodyActive[b]  = active[b];
+            }
+
+            // 블록 해상도로 마스크를 스캔해 바디별 픽셀 블록 개수 카운트
+            for (int b = 0; b < 6; b++)
+            {
+                if (!active[b]) { _perBodyBlockCount[b] = 0; continue; }
+
+                float ps   = DepthToPixelSize(_perBodyDepthMm[b]);
+                int   step = Mathf.Max(1, (int)ps);
+                byte  target = BodyIndexToByte(b);
+                int   cnt  = 0;
+
+                for (int y = step / 2; y < ColorH; y += step)
+                    for (int x = step / 2; x < ColorW; x += step)
+                        if (_maskOutput[y * ColorW + x] == target) cnt++;
+
+                _perBodyBlockCount[b] = cnt;
             }
 
             _maskReady = true;
@@ -371,9 +396,7 @@ namespace PixelMan
             }
 
             for (int b = 0; b < 6; b++)
-            {
                 _material.SetFloat($"_PixelSize{b}", _pixelSizesBuffer[b]);
-            }
 
             _material.SetFloat("_ErosionSize", _erosionSize);
         }
@@ -414,6 +437,7 @@ namespace PixelMan
 
             Font font = Resources.GetBuiltinResource<Font>("LegacyRuntime.ttf");
 
+            // Kinect 는 바디 인덱스 0-5 를 자유롭게 할당하므로 항상 6개 생성
             for (int b = 0; b < 6; b++)
             {
                 GameObject go = new GameObject($"BodyLabel_{b}");
@@ -458,20 +482,35 @@ namespace PixelMan
 
                 if (!_perBodyActive[b])
                 {
+                    // 비활성 시 스무딩 초기화 → 다음에 나타날 때 튀지 않음
+                    _smoothInit[b] = false;
                     _labelTexts[b].gameObject.SetActive(false);
                     continue;
                 }
 
-                float depthM = _perBodyDepthMm[b] > 0f ? _perBodyDepthMm[b] / 1000f : 0f;
-                float pixSize = _pixelSizesBuffer[b];
-                _labelTexts[b].text = $"{depthM:F1}m  /  {(int)pixSize}px";
+                float rawCx    = (float)_perBodyHeadCx[b];
+                float rawCount = (float)_perBodyBlockCount[b];
 
-                float u = (float)_perBodyHeadCx[b] / ColorW;
-                float v = 1f - (float)_perBodyHeadCy[b] / ColorH;
+                // EMA 스무딩: 처음 감지 시 즉시 초기화, 이후 lerp
+                if (!_smoothInit[b])
+                {
+                    _smoothHeadCx[b]    = rawCx;
+                    _smoothBlockCount[b] = rawCount;
+                    _smoothInit[b]      = true;
+                }
+                else
+                {
+                    float a = _labelSmoothing;
+                    _smoothHeadCx[b]    = Mathf.Lerp(_smoothHeadCx[b],    rawCx,    a);
+                    _smoothBlockCount[b] = Mathf.Lerp(_smoothBlockCount[b], rawCount, a);
+                }
 
-                _labelRts[b].anchorMin = new Vector2(u, v);
-                _labelRts[b].anchorMax = new Vector2(u, v);
-                _labelRts[b].anchoredPosition = new Vector2(0f, 12f); 
+                _labelTexts[b].text = $"{Mathf.RoundToInt(_smoothBlockCount[b])}px";
+
+                float u = _smoothHeadCx[b] / ColorW;
+                _labelRts[b].anchorMin        = new Vector2(u, 1f);
+                _labelRts[b].anchorMax        = new Vector2(u, 1f);
+                _labelRts[b].anchoredPosition = new Vector2(0f, -60f);
 
                 _labelTexts[b].gameObject.SetActive(true);
             }

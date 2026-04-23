@@ -2,14 +2,13 @@ Shader "PixelMan/PersonPixelate"
 {
     Properties
     {
-        _MainTex             ("Camera Texture",          2D)          = "white" {}
-        _MaskTex             ("Segmentation Mask",       2D)          = "black" {}
-
-        _PixelSize           ("Pixel Size (texels)",     Float)       = 8.0
-        _Threshold           ("Mask Threshold",          Range(0, 1)) = 0.5
-        _FlipMaskX           ("Flip Mask X",             Float)       = 0.0
-        _UsePerBodyPixelSize ("Use Per-Body Pixel Size", Float)       = 0.0
-        _ErosionSize         ("Erosion Size",            Float)       = 5.0 
+        _MainTex             ("Camera Texture",      2D)          = "white" {}
+        _MaskTex             ("Body Index Mask",     2D)          = "black" {}
+        _PixelSize           ("Default Pixel Size",  Float)       = 8.0
+        _Threshold           ("Mask Threshold",      Range(0, 1)) = 0.05
+        _FlipMaskX           ("Flip Mask X",         Float)       = 0.0
+        _UsePerBodyPixelSize ("Per-Body Pixel Size", Float)       = 0.0
+        _ErosionSize         ("Erosion Size",         Float)       = 0.0
     }
 
     SubShader
@@ -24,24 +23,21 @@ Shader "PixelMan/PersonPixelate"
             CGPROGRAM
             #pragma vertex   vert
             #pragma fragment frag
+            #pragma target   4.0
             #include "UnityCG.cginc"
 
             Texture2D    _MainTex;
             Texture2D    _MaskTex;
             SamplerState sampler_point_clamp;
 
-            float        _PixelSize;
-            float        _Threshold;
-            float        _FlipMaskX;
-            float        _UsePerBodyPixelSize;
-            float        _ErosionSize;
+            float _PixelSize;
+            float _Threshold;
+            float _FlipMaskX;
+            float _UsePerBodyPixelSize;
+            float _ErosionSize;
 
-            float        _PixelSize0;
-            float        _PixelSize1;
-            float        _PixelSize2;
-            float        _PixelSize3;
-            float        _PixelSize4;
-            float        _PixelSize5;
+            float _PixelSize0, _PixelSize1, _PixelSize2;
+            float _PixelSize3, _PixelSize4, _PixelSize5;
 
             struct appdata { float4 vertex : POSITION; float2 uv : TEXCOORD0; };
             struct v2f     { float4 pos    : SV_POSITION; float2 uv : TEXCOORD0; };
@@ -58,58 +54,72 @@ Shader "PixelMan/PersonPixelate"
             {
                 float texW = 1920.0;
                 float texH = 1080.0;
+                float2 texCoord = i.uv * float2(texW, texH);
 
-                // 1. 원본 UV에서 마스크를 읽어 현재 픽셀이 어떤 사람인지 식별
-                float  maskX_orig  = _FlipMaskX > 0.5 ? 1.0 - i.uv.x : i.uv.x;
-                float2 origMaskUV  = float2(maskX_orig, 1.0 - i.uv.y);
-                float  origBaseMask = _MaskTex.Sample(sampler_point_clamp, origMaskUV).r;
-
-                // 2. 식별된 사람의 픽셀 크기(ps) 결정. 사람이 아니면 전역 기본값 사용.
-                float ps = _PixelSize;
-                if (_UsePerBodyPixelSize > 0.5 && origBaseMask >= _Threshold)
+                if (_UsePerBodyPixelSize > 0.5)
                 {
-                    int bi = clamp((int)round(origBaseMask * 6.0) - 1, 0, 5);
-                    if (bi == 0) ps = _PixelSize0;
-                    else if (bi == 1) ps = _PixelSize1;
-                    else if (bi == 2) ps = _PixelSize2;
-                    else if (bi == 3) ps = _PixelSize3;
-                    else if (bi == 4) ps = _PixelSize4;
-                    else if (bi == 5) ps = _PixelSize5;
-                }
-                ps = max(ps, 1.0);
+                    // ── 바디별 독립 블록 격자 처리 ─────────────────────────────
+                    // 각 바디는 자신의 픽셀 크기(ps)로 블록을 만들고
+                    // 해당 블록 중심이 자신의 마스크 안에 있으면 색상 출력.
+                    // 1m 사람=48px 격자, 2.5m 사람=4px 격자 → 각자 경계가 각자 격자로 잘림.
+                    float bodyPs[6];
+                    bodyPs[0] = max(_PixelSize0, 1.0);
+                    bodyPs[1] = max(_PixelSize1, 1.0);
+                    bodyPs[2] = max(_PixelSize2, 1.0);
+                    bodyPs[3] = max(_PixelSize3, 1.0);
+                    bodyPs[4] = max(_PixelSize4, 1.0);
+                    bodyPs[5] = max(_PixelSize5, 1.0);
 
-                // 3. 현재 픽셀이 속한 "큰 픽셀 블록의 정중앙 UV"를 계산
-                float2 texCoord   = i.uv * float2(texW, texH);
-                float2 blockTexel = floor(texCoord / ps) * ps + ps * 0.5;
-                float2 blockUV    = clamp(blockTexel / float2(texW, texH), 0.0, 1.0);
-
-                // 4. [핵심] 마스크 자르기 판정을 1픽셀 단위가 아닌 "블록의 정중앙"에서 수행
-                // 블록 중심이 마스크 안에 있으면 블록 전체를 그리고, 밖이면 전체를 날려버림 (각진 실루엣 형성)
-                float  maskX_block = _FlipMaskX > 0.5 ? 1.0 - blockUV.x : blockUV.x;
-                float2 blockMaskUV = float2(maskX_block, 1.0 - blockUV.y);
-                float  blockMask = _MaskTex.Sample(sampler_point_clamp, blockMaskUV).r;
-
-                // 5. 블록 중심 기준 침식(Erosion) 연산
-                if (_ErosionSize > 0.0)
-                {
-                    float offsetX = _ErosionSize / texW;
-                    float offsetY = _ErosionSize / texH;
-
-                    float maskUp = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(0, offsetY)).r;
-                    float maskDown = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(0, -offsetY)).r;
-                    float maskLeft = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(-offsetX, 0)).r;
-                    float maskRight = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(offsetX, 0)).r;
-
-                    if (maskUp < _Threshold || maskDown < _Threshold || maskLeft < _Threshold || maskRight < _Threshold)
+                    [loop]
+                    for (int b = 0; b < 6; b++)
                     {
-                        return fixed4(0, 0, 0, 1);
+                        float ps = bodyPs[b];
+
+                        // 이 바디의 블록 격자로 블록 중심 UV 계산
+                        float2 blockTexel = floor(texCoord / ps) * ps + ps * 0.5;
+                        float2 blockUV    = clamp(blockTexel / float2(texW, texH), 0.0, 1.0);
+
+                        float  maskX       = _FlipMaskX > 0.5 ? 1.0 - blockUV.x : blockUV.x;
+                        float2 blockMaskUV = float2(maskX, 1.0 - blockUV.y);
+                        float  maskVal     = _MaskTex.Sample(sampler_point_clamp, blockMaskUV).r;
+
+                        // 블록 중심이 이 바디(b)인지 확인
+                        int maskBodyIdx = (int)round(maskVal * 6.0) - 1;
+                        if (maskBodyIdx != b) continue;
+
+                        // 침식 (ErosionSize > 0 일 때 경계 블록 제거)
+                        if (_ErosionSize > 0.0)
+                        {
+                            float ox = _ErosionSize / texW;
+                            float oy = _ErosionSize / texH;
+                            float mu = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2( 0,  oy)).r;
+                            float md = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2( 0, -oy)).r;
+                            float ml = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2(-ox,  0)).r;
+                            float mr = _MaskTex.Sample(sampler_point_clamp, blockMaskUV + float2( ox,  0)).r;
+                            if ((int)round(mu*6.0)-1 != b || (int)round(md*6.0)-1 != b ||
+                                (int)round(ml*6.0)-1 != b || (int)round(mr*6.0)-1 != b)
+                                continue;
+                        }
+
+                        return fixed4(_MainTex.Sample(sampler_point_clamp, blockUV).rgb, 1.0);
                     }
+
+                    return fixed4(0, 0, 0, 1); // 배경
                 }
+                else
+                {
+                    // ── 단일 픽셀 크기 모드 (MediaPipe 등 기존 방식) ───────────
+                    float ps = max(_PixelSize, 1.0);
+                    float2 blockTexel = floor(texCoord / ps) * ps + ps * 0.5;
+                    float2 blockUV    = clamp(blockTexel / float2(texW, texH), 0.0, 1.0);
 
-                if (blockMask < _Threshold) return fixed4(0, 0, 0, 1);
+                    float  maskX  = _FlipMaskX > 0.5 ? 1.0 - blockUV.x : blockUV.x;
+                    float  maskVal = _MaskTex.Sample(sampler_point_clamp,
+                                        float2(maskX, 1.0 - blockUV.y)).r;
 
-                // 6. 색상 출력
-                return fixed4(_MainTex.Sample(sampler_point_clamp, blockUV).rgb, 1.0);
+                    if (maskVal < _Threshold) return fixed4(0, 0, 0, 1);
+                    return fixed4(_MainTex.Sample(sampler_point_clamp, blockUV).rgb, 1.0);
+                }
             }
             ENDCG
         }
