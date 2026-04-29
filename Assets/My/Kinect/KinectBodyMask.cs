@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.UI;
@@ -28,6 +29,14 @@ namespace PixelMan
         [Header("Manual Pixel Size")]
         [SerializeField] private bool _useManualPixelSize;
         [SerializeField, Range(1f, 128f)] private float _manualPixelSize;
+
+        [Header("Cover Image")]
+        [Tooltip("커버 이미지의 CanvasGroup 컴포넌트")]
+        [SerializeField] private CanvasGroup _coverCanvasGroup;
+        [Tooltip("사람이 사라진 후 커버 이미지를 다시 표시할 때까지 대기 시간 (초)")]
+        [SerializeField] private float _coverHideDelay = 5f;
+        [Tooltip("페이드 인/아웃 시간 (초)")]
+        [SerializeField] private float _coverFadeDuration = 0.5f;
 
         [Header("Label Styling")]
         [SerializeField] private bool  _showLabels;
@@ -64,9 +73,14 @@ namespace PixelMan
 
         private Texture2D _colorTexture;
         private Texture2D _maskTexture;
-        private Material _material;
+        private Material  _material;
 
-        private bool _initialized;
+        private bool  _initialized;
+
+        // 커버 이미지 제어
+        private Coroutine _coverFadeCoroutine;
+        private float       _lastDetectedTime;
+        private bool        _coverVisible = true;
         private bool _shaderApplied;
 
         private readonly Text[]          _labelTexts   = new Text[6];
@@ -133,6 +147,9 @@ namespace PixelMan
             SetupOverlay();
             CreateLabels();
 
+            if (_coverCanvasGroup != null)
+                _coverCanvasGroup.alpha = 1f; // 시작 시 완전히 표시
+
             if (!_sensor.IsOpen)
             {
                 _sensor.Open();
@@ -158,6 +175,7 @@ namespace PixelMan
 
                 UpdatePixelSizes();
                 UpdateLabels();
+                UpdateCover();
 
                 if (!_shaderApplied)
                 {
@@ -520,6 +538,58 @@ namespace PixelMan
         /// 모든 레이블을 비활성화합니다.
         /// 화면에 표시할 사람이 없거나 설정에서 레이블이 꺼졌을 때 처리합니다.
         /// </summary>
+        private void UpdateCover()
+        {
+            if (_coverCanvasGroup == null) return;
+
+            bool anyone = false;
+            for (int b = 0; b < 6; b++)
+                if (_perBodyActive[b]) { anyone = true; break; }
+
+            if (anyone)
+            {
+                _lastDetectedTime = Time.time;
+
+                if (_coverVisible)
+                {
+                    _coverVisible = false;
+                    StartCoverFade(0f); // 페이드 아웃
+                }
+            }
+            else
+            {
+                if (!_coverVisible && Time.time - _lastDetectedTime >= _coverHideDelay)
+                {
+                    _coverVisible = true;
+                    StartCoverFade(1f); // 페이드 인
+                }
+            }
+        }
+
+        private void StartCoverFade(float targetAlpha)
+        {
+            if (_coverFadeCoroutine != null)
+                StopCoroutine(_coverFadeCoroutine);
+            _coverFadeCoroutine = StartCoroutine(FadeCover(targetAlpha));
+        }
+
+        private IEnumerator FadeCover(float targetAlpha)
+        {
+            float startAlpha = _coverCanvasGroup.alpha;
+            float elapsed    = 0f;
+            float duration   = Mathf.Max(_coverFadeDuration, 0.01f);
+
+            while (elapsed < duration)
+            {
+                elapsed += Time.deltaTime;
+                _coverCanvasGroup.alpha = Mathf.Lerp(startAlpha, targetAlpha, elapsed / duration);
+                yield return null;
+            }
+
+            _coverCanvasGroup.alpha = targetAlpha;
+            _coverFadeCoroutine = null;
+        }
+
         private void HideAllLabels()
         {
             for (int b = 0; b < 6; b++)
