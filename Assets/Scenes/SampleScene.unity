@@ -1224,6 +1224,7 @@ MonoBehaviour:
   _labelFontSize: 42
   _labelColor: {r: 1, g: 1, b: 1, a: 1}
   _labelSmoothing: 0.12
+  _sensorTimeout: 8
 --- !u!4 &1820479875
 Transform:
   m_ObjectHideFlags: 0

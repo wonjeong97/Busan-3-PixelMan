@@ -4,6 +4,7 @@ using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.UI;
 using Windows.Kinect;
+using Wonjeong.Utils;
 
 namespace PixelMan
 {
@@ -44,6 +45,13 @@ namespace PixelMan
         [SerializeField] private Color _labelColor;
         [Tooltip("라벨 위치/숫자 스무딩 (0=고정, 1=즉시반응)")]
         [SerializeField, Range(0.01f, 1f)] private float _labelSmoothing = 0.12f;
+        
+        [Header("Watchdog Settings")]
+        [Tooltip("프레임 수신 타임아웃(초). 이 시간 동안 데이터가 없으면 센서 강제 재시작 (좀비 현상 방지)")]
+        [SerializeField] private float _sensorTimeout = 8f;
+
+        private float _lastFrameTime;
+        private bool  _isRestarting;
 
         private KinectSensor _sensor;
         private MultiSourceFrameReader _reader;
@@ -109,7 +117,6 @@ namespace PixelMan
         {
             if (!ValidateReferences()) return;
 
-            // KinectSensor는 C# 네이티브 객체이므로 명시적 null 검사 허용
             _sensor = KinectSensor.GetDefault();
             if (_sensor == null)
             {
@@ -156,6 +163,7 @@ namespace PixelMan
             }
 
             _initialized = true;
+            _lastFrameTime = Time.time;
             Debug.Log("[KinectBodyMask] 초기화 완료");
         }
 
@@ -191,10 +199,20 @@ namespace PixelMan
                     _material.SetFloatArray("_PixelSizes", _pixelSizesBuffer);
                 }
             }
-
+            
+            if (_isRestarting) return;
+            
             MultiSourceFrame frame = _reader.AcquireLatestFrame();
-            if (frame == null) return;
-
+            if (frame == null) 
+            {
+                if (Time.time - _lastFrameTime > _sensorTimeout)
+                {
+                    StartCoroutine(RestartSensorRoutine());
+                }
+                return;
+            }
+            
+            _lastFrameTime = Time.time;
             bool gotDepth = false;
             
             using (ColorFrame colorFrame = frame.ColorFrameReference.AcquireFrame())
@@ -255,6 +273,43 @@ namespace PixelMan
             {
                 if (_labelTexts[b]) Destroy(_labelTexts[b].gameObject);
             }
+        }
+        
+        /// <summary>
+        /// 키넥트 응답이 없을 때 하드웨어를 강제로 재연결합니다.
+        /// PC 부팅 직후 서비스와 유니티 간의 초기화 타이밍이 어긋나 발생하는 좀비 상태를 복구하기 위함입니다.
+        /// </summary>
+        private IEnumerator RestartSensorRoutine()
+        {
+            Debug.LogWarning("[KinectBodyMask] 센서 응답 없음. 하드웨어 재연결을 시도합니다...");
+            _isRestarting = true;
+
+            // 기존 하드웨어 락 해제
+            CloseKinectSensor();
+
+            // 윈도우 키넥트 서비스가 포트를 완전히 놓아줄 때까지 대기
+            yield return CoroutineData.GetWaitForSeconds(3f);
+
+            _sensor = KinectSensor.GetDefault();
+            if (_sensor != null)
+            {
+                _mapper = _sensor.CoordinateMapper;
+                _reader = _sensor.OpenMultiSourceFrameReader(FrameSourceTypes.Color | FrameSourceTypes.Depth | FrameSourceTypes.BodyIndex);
+                
+                if (!_sensor.IsOpen)
+                {
+                    _sensor.Open();
+                }
+
+                Debug.Log("[KinectBodyMask] 센서 자동 재연결 완료");
+            }
+            else
+            {
+                Debug.LogError("[KinectBodyMask] 재연결 실패: 센서를 찾을 수 없습니다.");
+            }
+
+            _lastFrameTime = Time.time;
+            _isRestarting = false;
         }
 
         /// <summary>
