@@ -62,6 +62,10 @@ namespace PixelMan
         private const int DepthW = 512;
         private const int DepthH = 424;
 
+        // 세로형 디스플레이(1080x1920) 출력 비율. 키넥트 컬러 스트림(16:9, 가로)에서
+        // 이 비율에 맞는 중앙 영역만 잘라서 보여주기 위해 사용합니다.
+        private const float TargetAspect = 9f / 16f;
+
         private byte[] _colorData;
         private ushort[] _depthWork;
         private byte[] _bodyIndexWork;
@@ -149,7 +153,7 @@ namespace PixelMan
             _material = new Material(_pixelateShader);
 
             _cameraDisplay.texture = _colorTexture;
-            _cameraDisplay.uvRect = new Rect(0f, 1f, 1f, -1f);
+            _cameraDisplay.uvRect = ComputeCroppedUvRect();
 
             SetupOverlay();
             CreateLabels();
@@ -342,36 +346,16 @@ namespace PixelMan
         /// </summary>
         private void BuildMaskBackground()
         {
-            bool[] active = new bool[6];
-            int count = 0;
-            
-            for (int i = 0; i < DepthW * DepthH; i++)
-            {
-                byte idx = _bodyIndexWork[i];
-                if (idx < 6 && !active[idx] && count < _maxUsers)
-                {
-                    active[idx] = true;
-                    count++;
-                }
-            }
-
-            Array.Clear(_maskOutput, 0, _maskOutput.Length);
-
-            if (count == 0)
-            {
-                for (int b = 0; b < 6; b++) _perBodyDepthMm[b] = -1f;
-                for (int b = 0; b < 6; b++) _perBodyActive[b] = false;
-                _maskReady = true;
-                return;
-            }
-
             _mapper.MapDepthFrameToColorSpace(_depthWork, _depthToColor);
 
+            // 1차 스캔: 활성 바디를 결정하기 전에 프레임에 나타난 모든 바디의 평균 깊이/머리 위치를 먼저 계산합니다.
+            // (거리 기준으로 _maxUsers 명을 고르려면 마스크를 그리기 전에 깊이 값이 필요합니다.)
+            bool[] present = new bool[6];
             long[] depthSum = new long[6];
             int[] depthCount = new int[6];
             int[] headCy = new int[6];
             int[] headCx = new int[6];
-            
+
             for (int b = 0; b < 6; b++)
             {
                 headCy[b] = int.MaxValue;
@@ -380,7 +364,9 @@ namespace PixelMan
             for (int i = 0; i < DepthW * DepthH; i++)
             {
                 byte bodyIdx = _bodyIndexWork[i];
-                if (bodyIdx >= 6 || !active[bodyIdx]) continue;
+                if (bodyIdx >= 6) continue;
+
+                present[bodyIdx] = true;
 
                 ushort d = _depthWork[i];
                 if (d > 0)
@@ -392,7 +378,7 @@ namespace PixelMan
                 ColorSpacePoint cp = _depthToColor[i];
                 int cx = (int)(cp.X + 0.5f);
                 int cy = (int)(cp.Y + 0.5f);
-                
+
                 if ((uint)cx >= ColorW || (uint)cy >= ColorH) continue;
 
                 if (cy < headCy[bodyIdx])
@@ -400,6 +386,38 @@ namespace PixelMan
                     headCy[bodyIdx] = cy;
                     headCx[bodyIdx] = cx;
                 }
+            }
+
+            // 감지된 사람 중 카메라와 가장 가까운 _maxUsers 명만 활성화 (여러 명이 잡혀도 항상 가장 가까운 사람을 추적)
+            bool[] active = SelectClosestBodies(present, depthSum, depthCount);
+
+            Array.Clear(_maskOutput, 0, _maskOutput.Length);
+
+            bool anyActive = false;
+            for (int b = 0; b < 6; b++)
+            {
+                if (active[b]) { anyActive = true; break; }
+            }
+
+            if (!anyActive)
+            {
+                for (int b = 0; b < 6; b++) _perBodyDepthMm[b] = -1f;
+                for (int b = 0; b < 6; b++) _perBodyActive[b] = false;
+                _maskReady = true;
+                return;
+            }
+
+            // 2차 스캔: 활성 바디만 마스크에 페인팅
+            for (int i = 0; i < DepthW * DepthH; i++)
+            {
+                byte bodyIdx = _bodyIndexWork[i];
+                if (bodyIdx >= 6 || !active[bodyIdx]) continue;
+
+                ColorSpacePoint cp = _depthToColor[i];
+                int cx = (int)(cp.X + 0.5f);
+                int cy = (int)(cp.Y + 0.5f);
+
+                if ((uint)cx >= ColorW || (uint)cy >= ColorH) continue;
 
                 int flippedCy = ColorH - 1 - cy;
                 byte maskByte = BodyIndexToByte(bodyIdx);
@@ -409,12 +427,12 @@ namespace PixelMan
                 {
                     int py = flippedCy + dy;
                     if ((uint)py >= ColorH) continue;
-                    
+
                     for (int dx = -1; dx <= 1; dx++)
                     {
                         int px = cx + dx;
                         if ((uint)px >= ColorW) continue;
-                        
+
                         _maskOutput[py * ColorW + px] = maskByte;
                     }
                 }
@@ -422,7 +440,7 @@ namespace PixelMan
 
             for (int b = 0; b < 6; b++)
             {
-                _perBodyDepthMm[b] = depthCount[b] > 0 ? (float)depthSum[b] / depthCount[b] : -1f;
+                _perBodyDepthMm[b] = active[b] && depthCount[b] > 0 ? (float)depthSum[b] / depthCount[b] : -1f;
                 _perBodyHeadCx[b]  = headCx[b];
                 _perBodyHeadCy[b]  = headCy[b] != int.MaxValue ? headCy[b] : 0;
                 _perBodyActive[b]  = active[b];
@@ -446,6 +464,40 @@ namespace PixelMan
             }
 
             _maskReady = true;
+        }
+
+        /// <summary>
+        /// 감지된 바디 중 평균 깊이가 가까운 순으로 최대 _maxUsers 명을 선택합니다.
+        /// 여러 명이 동시에 프레임에 잡혀도 항상 카메라에 가장 가까운 사람(들)만 추적하기 위함입니다.
+        /// </summary>
+        private bool[] SelectClosestBodies(bool[] present, long[] depthSum, int[] depthCount)
+        {
+            bool[] active = new bool[6];
+            int remaining = _maxUsers;
+
+            while (remaining > 0)
+            {
+                int best = -1;
+                float bestDepth = float.MaxValue;
+
+                for (int b = 0; b < 6; b++)
+                {
+                    if (!present[b] || active[b]) continue;
+
+                    float avg = depthCount[b] > 0 ? (float)depthSum[b] / depthCount[b] : float.MaxValue;
+                    if (avg < bestDepth)
+                    {
+                        bestDepth = avg;
+                        best = b;
+                    }
+                }
+
+                if (best < 0) break;
+                active[best] = true;
+                remaining--;
+            }
+
+            return active;
         }
 
         /// <summary>
@@ -580,7 +632,10 @@ namespace PixelMan
 
                 _labelTexts[b].text = $"{Mathf.RoundToInt(_smoothBlockCount[b])}px";
 
-                float u = _smoothHeadCx[b] / ColorW;
+                // headCx는 원본(1920폭) 텍스처 기준 좌표이므로, 화면에 잘려서 보이는 UV 구간 기준으로 재매핑합니다.
+                Rect displayUv = _cameraDisplay.uvRect;
+                float rawU = _smoothHeadCx[b] / ColorW;
+                float u = displayUv.width > 0f ? Mathf.Clamp01((rawU - displayUv.x) / displayUv.width) : rawU;
                 _labelRts[b].anchorMin        = new Vector2(u, 1f);
                 _labelRts[b].anchorMax        = new Vector2(u, 1f);
                 _labelRts[b].anchoredPosition = new Vector2(0f, -60f);
@@ -674,6 +729,18 @@ namespace PixelMan
             _pixelOverlay.material = _material;
             _pixelOverlay.gameObject.SetActive(true);
             _shaderApplied = true;
+        }
+
+        /// <summary>
+        /// 가로(16:9) 컬러 스트림에서 세로형(TargetAspect) 출력에 맞는 중앙 영역만 잘라내는 UV 사각형을 계산합니다.
+        /// Y축은 기존과 동일하게 반전합니다.
+        /// </summary>
+        private static Rect ComputeCroppedUvRect()
+        {
+            float sourceAspect = (float)ColorW / ColorH;
+            float widthFraction = Mathf.Clamp01(TargetAspect / sourceAspect);
+            float xMin = (1f - widthFraction) * 0.5f;
+            return new Rect(xMin, 1f, widthFraction, -1f);
         }
 
         /// <summary>
